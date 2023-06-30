@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"go.uber.org/multierr"
 
+
 	"github.com/elastic/elastic-agent-libs/logp"
 )
 
@@ -199,19 +200,18 @@ func (p *fetchRequest) fetchListeners(lb types.LoadBalancer) {
 
 			page, err := paginator.NextPage(p.context)
 			if err != nil {
-				awsErr, ok := err.(awserr.Error)
-				if ok && awsErr.Code() == "ListenerNotFound" {
+				if err.Error() == "ListenerNotFound" {
 					p.logger.Warnf("Listener not found for load balancer: %s", *lb.LoadBalancerArn)
 					continue
-				} else {
-					p.recordErrResult(err)
 				}
+				p.recordErrResult(err)
+				return
 			}
+
 			for i := range page.Listeners {
 				p.recordGoodResult(&lb, &page.Listeners[i])
 			}
 		}
-
 	}
 }
 
