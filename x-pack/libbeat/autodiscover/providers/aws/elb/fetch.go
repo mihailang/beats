@@ -199,7 +199,13 @@ func (p *fetchRequest) fetchListeners(lb types.LoadBalancer) {
 
 			page, err := paginator.NextPage(p.context)
 			if err != nil {
-				p.recordErrResult(err)
+				awsErr, ok := err.(awserr.Error)
+				if ok && awsErr.Code() == "ListenerNotFound" {
+					p.logger.Warnf("Listener not found for load balancer: %s", *lb.LoadBalancerArn)
+					continue
+				} else {
+					p.recordErrResult(err)
+				}
 			}
 			for i := range page.Listeners {
 				p.recordGoodResult(&lb, &page.Listeners[i])
@@ -208,6 +214,7 @@ func (p *fetchRequest) fetchListeners(lb types.LoadBalancer) {
 
 	}
 }
+
 
 func (p *fetchRequest) recordGoodResult(lb *types.LoadBalancer, lbl *types.Listener) {
 	p.resultsLock.Lock()
