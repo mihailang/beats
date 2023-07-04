@@ -7,16 +7,26 @@ package elb
 import (
 	"context"
 	"sync"
+	"time"
+	"math"
+
 
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"go.uber.org/multierr"
-
+	"github.com/aws/aws-sdk-go/aws/awserr"
 
 	"github.com/elastic/elastic-agent-libs/logp"
+	"golang.org/x/sync/semaphore"
 )
 
+
+
+var (
+	maxAPICalls   = 3 // Set this to a suitable value based on AWS limits.
+	apiSemaphore = semaphore.NewWeighted(int64(maxAPICalls))
+)
 // fetcher is an interface that can fetch a list of lbListener (load balancer + listener) objects without pagination being necessary.
 type fetcher interface {
 	fetch(ctx context.Context) ([]*lbListener, error)
@@ -120,7 +130,19 @@ type fetchRequest struct {
 	context      context.Context
 	cancel       func()
 	logger       *logp.Logger
+    totalELBs    int
 }
+
+const maxWaitTime = 60 // Maximum wait time is 60 seconds
+
+func backoff(attempt int) time.Duration {
+	minTime := float64(1)
+	maxTime := float64(60)
+	factor := math.Pow(2, float64(attempt))
+	sleep := math.Min(minTime*factor, maxTime)
+	return time.Duration(sleep) * time.Second
+}
+
 
 func (p *fetchRequest) fetch() ([]*lbListener, error) {
 	p.dispatch(p.fetchAllPages)
@@ -132,7 +154,7 @@ func (p *fetchRequest) fetch() ([]*lbListener, error) {
 	// consistency between the last write and this read
 	p.resultsLock.Lock()
 	defer p.resultsLock.Unlock()
-
+    // Retrieve the total number of items from the first page
 	// Since everything is async we have to retrieve any errors that occurred from here
 	if len(p.errs) > 0 {
 		return nil, multierr.Combine(p.errs...)
@@ -163,11 +185,24 @@ func (p *fetchRequest) fetchNextPage() {
 	page, err := p.paginator.NextPage(p.context)
 	if err != nil {
 		p.recordErrResult(err)
+		return
 	}
+
+	if page.LoadBalancers == nil {
+		p.logger.Error("LoadBalancers in fetched page is nil")
+		return
+	}
+
+	p.logger.Info("Fetching next page of listeners")
+	p.totalELBs += len(page.LoadBalancers)
+	p.logger.Info("Total ELBs left to be processed: ", p.totalELBs)
 
 	for _, lb := range page.LoadBalancers {
 		p.dispatch(func() { p.fetchListeners(lb) })
 	}
+
+	p.totalELBs -= len(page.LoadBalancers)
+	p.logger.Info("Total ELBs left to be processed: ", p.totalELBs)
 }
 
 // dispatch runs the given func in a new goroutine, properly throttling requests
@@ -189,31 +224,70 @@ func (p *fetchRequest) fetchListeners(lb types.LoadBalancer) {
 	describeListenersInput := &elasticloadbalancingv2.DescribeListenersInput{LoadBalancerArn: lb.LoadBalancerArn}
 	paginator := elasticloadbalancingv2.NewDescribeListenersPaginator(p.client, describeListenersInput)
 
+	attempt := 1
+
 	for {
 		select {
 		case <-p.context.Done():
+			p.logger.Debug("Context done, stopping listener fetch")
 			return
 		default:
 			if !paginator.HasMorePages() {
+				p.logger.Debug("No more pages, stopping listener fetch")
+				// Decrement totalELBs and log it here
+				p.totalELBs--
+				p.logger.Info("Total ELBs left to be processed: ", p.totalELBs)
 				return
 			}
 
+			// Acquire a semaphore slot before making an API call
+			if err := apiSemaphore.Acquire(p.context, 1); err != nil {
+				p.logger.Error("Failed to acquire semaphore:", err)
+				return
+			}
+
+			p.logger.Debug("Fetching next page of listeners")
 			page, err := paginator.NextPage(p.context)
 			if err != nil {
-				if err.Error() == "ListenerNotFound" {
-					p.logger.Warnf("Listener not found for load balancer: %s", *lb.LoadBalancerArn)
-					continue
+				apiSemaphore.Release(1) // Make sure to release the semaphore in case of an error
+				if aerr, ok := err.(awserr.Error); ok {
+					switch aerr.Code() {
+					case "ThrottlingException":
+						// We got throttled, apply exponential backoff
+						waitTime := backoff(attempt)
+						time.Sleep(waitTime)
+						attempt++
+						continue
+					}
 				}
+
+				p.logger.Errorf("Error fetching page: %v", err)
 				p.recordErrResult(err)
 				return
 			}
 
+			apiSemaphore.Release(1) // Release the semaphore after a successful API call
+
+			if page == nil {
+				p.logger.Error("Fetched page is nil")
+				return
+			}
+
+			if page.Listeners == nil {
+				p.logger.Error("Listeners in fetched page is nil")
+				return
+			}
+
 			for i := range page.Listeners {
+				p.logger.Debugf("Recording listener: %v", page.Listeners[i])
 				p.recordGoodResult(&lb, &page.Listeners[i])
 			}
 		}
 	}
 }
+
+
+
 
 
 func (p *fetchRequest) recordGoodResult(lb *types.LoadBalancer, lbl *types.Listener) {
